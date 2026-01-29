@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <driver/i2s.h>
 #include <Wire.h>
+#include <esp_heap_caps.h>
 #include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -14,6 +15,36 @@
 #include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
+
+// ============================================================================
+// HARDWARE SETUP - Seeed Studio XIAO ESP32 S3 Sense
+// ============================================================================
+//
+// BUILT-IN COMPONENTS (No External Wiring):
+//   - OV2640 Camera Module (already integrated)
+//   - INMP441 Microphone (already integrated, I2S on GPIOs 2, 41, 42)
+//   - RGB LED (GPIO 21)
+//
+// EXTERNAL CONNECTIONS REQUIRED:
+//
+//   1. OLED Display (SSD1306, 128x64, I2C Address 0x3C):
+//      SDA  → GPIO 5 (default I2C SDA)
+//      SCL  → GPIO 6 (default I2C SCL)
+//      VCC  → 3.3V
+//      GND  → GND
+//
+//   2. I2S Speaker/Amplifier (e.g., MAX98357A):
+//      BCK  → GPIO 4 (Bit Clock)
+//      WS   → GPIO 8 (Word Select/LRCK)
+//      DOUT → GPIO 9 (Data Out)
+//      VIN  → 3.3V or 5V (check your amp)
+//      GND  → GND
+//
+//   3. Power:
+//      - Connect USB-C cable for power and programming
+//      - All peripherals use 3.3V logic level
+//
+// ============================================================================
 
 // XIAO ESP32 S3 Sense built-in LED
 #define LED_PIN LED_BUILTIN // GPIO 21 on XIAO ESP32 S3
@@ -70,7 +101,7 @@ bool ensureWiFiConnected()
 #define BUFFER_SIZE 512
 
 // I2S Speaker Configuration (using different pins)
-#define I2S_SPEAKER_BCK 5  // Bit Clock (changed from 7 to avoid I2C conflict)
+#define I2S_SPEAKER_BCK 4  // Bit Clock (moved to GPIO 4 to avoid I2C SDA conflict)
 #define I2S_SPEAKER_WS 8   // Word Select (LRCK)
 #define I2S_SPEAKER_DOUT 9 // Data Out
 #define I2S_SPEAKER_PORT I2S_NUM_1
@@ -98,12 +129,12 @@ bool ensureWiFiConnected()
 // FEATURE FLAGS FOR ATOMIC TESTING
 // ============================================================================
 #define ENABLE_WAKE_WORD true      // Wake word detection
-#define ENABLE_BACKEND true         // STT + LLM processing via backend
-#define ENABLE_SPEAKER true         // Audio playback
-#define ENABLE_CAMERA true          // Camera initialization and face detection
-#define ENABLE_DISPLAY true         // OLED display and eyes
-#define ENABLE_VERBOSE_DEBUG true   // Enhanced serial logging
-#define ENABLE_MANUAL_TRIGGER true  // Serial command to trigger recording
+#define ENABLE_BACKEND true        // STT + LLM processing via backend
+#define ENABLE_SPEAKER true        // Audio playback
+#define ENABLE_CAMERA false        // Camera initialization and face detection
+#define ENABLE_DISPLAY true        // OLED display and eyes
+#define ENABLE_VERBOSE_DEBUG true  // Enhanced serial logging
+#define ENABLE_MANUAL_TRIGGER true // Serial command to trigger recording
 
 // Test Mode Presets (comment/uncomment to activate)
 // #define TEST_MODE_MIC_ONLY          // Test: Microphone recording only
@@ -115,70 +146,74 @@ bool ensureWiFiConnected()
 
 // Apply test mode overrides
 #ifdef TEST_MODE_MIC_ONLY
-  #undef ENABLE_WAKE_WORD
-  #undef ENABLE_BACKEND
-  #undef ENABLE_SPEAKER
-  #undef ENABLE_CAMERA
-  #undef ENABLE_DISPLAY
-  #define ENABLE_WAKE_WORD false
-  #define ENABLE_BACKEND false
-  #define ENABLE_SPEAKER false
-  #define ENABLE_CAMERA false
-  #define ENABLE_DISPLAY false
+#undef ENABLE_WAKE_WORD
+#undef ENABLE_BACKEND
+#undef ENABLE_SPEAKER
+#undef ENABLE_CAMERA
+#undef ENABLE_DISPLAY
+#define ENABLE_WAKE_WORD false
+#define ENABLE_BACKEND false
+#define ENABLE_SPEAKER false
+#define ENABLE_CAMERA false
+#define ENABLE_DISPLAY false
 #endif
 
 #ifdef TEST_MODE_WAKE_WORD_ONLY
-  #undef ENABLE_BACKEND
-  #undef ENABLE_SPEAKER
-  #undef ENABLE_CAMERA
-  #define ENABLE_BACKEND false
-  #define ENABLE_SPEAKER false
-  #define ENABLE_CAMERA false
+#undef ENABLE_BACKEND
+#undef ENABLE_SPEAKER
+#undef ENABLE_CAMERA
+#define ENABLE_BACKEND false
+#define ENABLE_SPEAKER false
+#define ENABLE_CAMERA false
 #endif
 
 #ifdef TEST_MODE_BACKEND_ONLY
-  #undef ENABLE_WAKE_WORD
-  #undef ENABLE_SPEAKER
-  #undef ENABLE_CAMERA
-  #define ENABLE_WAKE_WORD false
-  #define ENABLE_SPEAKER false
-  #define ENABLE_CAMERA false
+#undef ENABLE_WAKE_WORD
+#undef ENABLE_SPEAKER
+#undef ENABLE_CAMERA
+#define ENABLE_WAKE_WORD false
+#define ENABLE_SPEAKER false
+#define ENABLE_CAMERA false
 #endif
 
 #ifdef TEST_MODE_SPEAKER_ONLY
-  #undef ENABLE_WAKE_WORD
-  #undef ENABLE_BACKEND
-  #undef ENABLE_CAMERA
-  #define ENABLE_WAKE_WORD false
-  #define ENABLE_BACKEND false
-  #define ENABLE_CAMERA false
+#undef ENABLE_WAKE_WORD
+#undef ENABLE_BACKEND
+#undef ENABLE_CAMERA
+#define ENABLE_WAKE_WORD false
+#define ENABLE_BACKEND false
+#define ENABLE_CAMERA false
 #endif
 
 #ifdef TEST_MODE_CAMERA_ONLY
-  #undef ENABLE_WAKE_WORD
-  #undef ENABLE_BACKEND
-  #undef ENABLE_SPEAKER
-  #define ENABLE_WAKE_WORD false
-  #define ENABLE_BACKEND false
-  #define ENABLE_SPEAKER false
+#undef ENABLE_WAKE_WORD
+#undef ENABLE_BACKEND
+#undef ENABLE_SPEAKER
+#define ENABLE_WAKE_WORD false
+#define ENABLE_BACKEND false
+#define ENABLE_SPEAKER false
 #endif
 
 #ifdef TEST_MODE_DISPLAY_ONLY
-  #undef ENABLE_WAKE_WORD
-  #undef ENABLE_BACKEND
-  #undef ENABLE_SPEAKER
-  #undef ENABLE_CAMERA
-  #define ENABLE_WAKE_WORD false
-  #define ENABLE_BACKEND false
-  #define ENABLE_SPEAKER false
-  #define ENABLE_CAMERA false
+#undef ENABLE_WAKE_WORD
+#undef ENABLE_BACKEND
+#undef ENABLE_SPEAKER
+#undef ENABLE_CAMERA
+#define ENABLE_WAKE_WORD false
+#define ENABLE_BACKEND false
+#define ENABLE_SPEAKER false
+#define ENABLE_CAMERA false
 #endif
 
 // Manual trigger flag
 volatile bool manualTriggerRequested = false;
 
 // Verbose logging helper
-#define DEBUG_LOG(fmt, ...) if (ENABLE_VERBOSE_DEBUG) { Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); }
+#define DEBUG_LOG(fmt, ...)                            \
+  if (ENABLE_VERBOSE_DEBUG)                            \
+  {                                                    \
+    Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); \
+  }
 
 // Wake word detection settings
 const char *WAKE_WORD = "marcus";
@@ -187,15 +222,15 @@ const int RECORDING_DURATION_MS = 5000;                                      // 
 const int MAX_AUDIO_SIZE = SAMPLE_RATE * (RECORDING_DURATION_MS / 1000) * 2; // 16-bit samples
 
 // Silence detection settings for end-of-speech detection
-const int SILENCE_THRESHOLD = 200;    // Energy threshold for silence
-const int SILENCE_DURATION_MS = 1500; // Stop after 1.5 seconds of silence
-const int MIN_RECORDING_MS = 1000;    // Minimum 1 second recording
-const int MAX_RECORDING_MS = 10000;   // Maximum 10 seconds
+const int SILENCE_THRESHOLD = 200;     // Energy threshold for silence
+const int SILENCE_DURATION_MS = 1500;  // Stop after 1.5 seconds of silence
+const int MIN_RECORDING_MS = 1000;     // Minimum 1 second recording
+const int MAX_RECORDING_MS = 10000;    // Maximum 10 seconds
 const int NO_SPEECH_TIMEOUT_MS = 5000; // Abort if no speech detected after wake word for 5 seconds
 
 // Circular buffer for I2S audio recording
 #define CIRCULAR_BUFFER_SIZE (SAMPLE_RATE * 3 * 2) // 3 seconds of 16-bit audio (~96KB)
-static int16_t circularAudioBuffer[CIRCULAR_BUFFER_SIZE];
+static int16_t circularAudioBuffer[CIRCULAR_BUFFER_SIZE] EXT_RAM_ATTR;
 static volatile size_t writeIndex = 0;
 static volatile size_t readIndex = 0;
 static volatile bool isRecording = false;
@@ -683,7 +718,7 @@ void setupCamera()
   }
 
   DEBUG_LOG("Initializing camera...");
-  
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -853,7 +888,7 @@ void cameraTask(void *parameter)
       if (fb)
       {
         DEBUG_LOG("Camera frame: %d bytes, %dx%d", fb->len, fb->width, fb->height);
-        
+
         // Basic face detection based on JPEG analysis
         // For production: integrate ESP-WHO face detection library
         // This is a placeholder - check if image data suggests faces
@@ -1024,7 +1059,7 @@ void audioTask(void *parameter)
         unsigned long elapsed = millis() - recordingStartTime;
         unsigned long silenceDuration = millis() - lastSpeechTime;
 
-        DEBUG_LOG("Recording: %.1fs elapsed, %.1fs silence, isSilent: %d, speechDetected: %d", 
+        DEBUG_LOG("Recording: %.1fs elapsed, %.1fs silence, isSilent: %d, speechDetected: %d",
                   elapsed / 1000.0, silenceDuration / 1000.0, isSilent, speechDetectedAfterWakeWord);
 
         // Check for no-speech timeout (wake word but no actual speech)
@@ -1095,7 +1130,7 @@ void audioTask(void *parameter)
         // Backend disabled - simulate response for testing
         Serial.println("[TEST] Backend disabled - skipping processing");
         DEBUG_LOG("Would have sent %d bytes to backend", audioSize);
-        
+
         // Skip to next state or return to listening
         vTaskDelay(pdMS_TO_TICKS(1000));
         transitionToState(STATE_LISTENING_FOR_WAKE_WORD);
@@ -1144,7 +1179,7 @@ bool sendAudioToBackend()
 {
   size_t audioDataSize = getRecordedDataSize();
   DEBUG_LOG("sendAudioToBackend: audioDataSize=%d", audioDataSize);
-  
+
   if (WiFi.status() != WL_CONNECTED || audioDataSize == 0)
   {
     Serial.println("[ERROR] WiFi not connected or no audio data");
@@ -1195,9 +1230,9 @@ bool sendAudioToBackend()
   memcpy(wavHeader + 36, "data", 4);
   memcpy(wavHeader + 40, &dataSize, 4);
 
-  // Combine header and audio data
+  // Combine header and audio data (temporary buffer for HTTP upload)
   size_t totalSize = 44 + recordedAudioBufferSize;
-  uint8_t *fullAudio = (uint8_t *)malloc(totalSize);
+  uint8_t *fullAudio = (uint8_t *)malloc(totalSize); // Use regular heap for temporary data
   if (!fullAudio)
   {
     Serial.println("[ERROR] Failed to allocate full audio buffer!");
@@ -1288,14 +1323,14 @@ bool sendAudioToBackend()
 
     if (contentLength > 0)
     {
-      // Reuse or allocate MP3 buffer
+      // Reuse or allocate MP3 buffer in PSRAM
       if (mp3BufferCapacity < contentLength)
       {
         if (mp3DataBuffer)
-          free(mp3DataBuffer);
-        mp3DataBuffer = (uint8_t *)malloc(contentLength);
+          heap_caps_free(mp3DataBuffer);
+        mp3DataBuffer = (uint8_t *)heap_caps_malloc(contentLength, MALLOC_CAP_SPIRAM);
         mp3BufferCapacity = contentLength;
-        DEBUG_LOG("Allocated MP3 buffer: %d bytes", contentLength);
+        DEBUG_LOG("Allocated MP3 buffer: %d bytes (PSRAM)", contentLength);
       }
 
       if (!mp3DataBuffer)
@@ -1408,15 +1443,15 @@ void setup()
   Serial.printf("[MEM] Free heap: %d bytes\n", ESP.getFreeHeap());
   Serial.printf("[MEM] PSRAM: %d bytes\n", ESP.getPsramSize());
 
-  // Pre-allocate recording buffer
-  preAllocatedRecordBuffer = (int16_t *)malloc(RECORDING_BUFFER_SIZE);
+  // Pre-allocate recording buffer in PSRAM
+  preAllocatedRecordBuffer = (int16_t *)heap_caps_malloc(RECORDING_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
   if (!preAllocatedRecordBuffer)
   {
     Serial.println("Failed to pre-allocate recording buffer!");
   }
   else
   {
-    Serial.println("Recording buffer pre-allocated");
+    Serial.println("Recording buffer pre-allocated in PSRAM");
   }
 
   // Initialize circular buffer
@@ -1557,12 +1592,12 @@ void setup()
   if (ENABLE_CAMERA)
     Serial.printf("  [%s] Camera\n", "OK"); // Assume OK if camera initialized
   Serial.printf("  [%s] Recording Buffer\n", preAllocatedRecordBuffer ? "OK" : "FAIL");
-  
+
   if (ENABLE_MANUAL_TRIGGER)
   {
     Serial.println("\n[MANUAL] Send 't' via Serial to manually trigger recording");
   }
-  
+
   if (ENABLE_WAKE_WORD)
   {
     Serial.println("\nListening for wake word...\n");
