@@ -94,6 +94,92 @@ bool ensureWiFiConnected()
 #define HREF_GPIO_NUM 47
 #define PCLK_GPIO_NUM 13
 
+// ============================================================================
+// FEATURE FLAGS FOR ATOMIC TESTING
+// ============================================================================
+#define ENABLE_WAKE_WORD true      // Wake word detection
+#define ENABLE_BACKEND true         // STT + LLM processing via backend
+#define ENABLE_SPEAKER true         // Audio playback
+#define ENABLE_CAMERA true          // Camera initialization and face detection
+#define ENABLE_DISPLAY true         // OLED display and eyes
+#define ENABLE_VERBOSE_DEBUG true   // Enhanced serial logging
+#define ENABLE_MANUAL_TRIGGER true  // Serial command to trigger recording
+
+// Test Mode Presets (comment/uncomment to activate)
+// #define TEST_MODE_MIC_ONLY          // Test: Microphone recording only
+// #define TEST_MODE_WAKE_WORD_ONLY    // Test: Wake word detection only
+// #define TEST_MODE_BACKEND_ONLY      // Test: Backend communication only
+// #define TEST_MODE_SPEAKER_ONLY      // Test: Speaker playback only
+// #define TEST_MODE_CAMERA_ONLY       // Test: Camera capture only
+// #define TEST_MODE_DISPLAY_ONLY      // Test: Display and eyes only
+
+// Apply test mode overrides
+#ifdef TEST_MODE_MIC_ONLY
+  #undef ENABLE_WAKE_WORD
+  #undef ENABLE_BACKEND
+  #undef ENABLE_SPEAKER
+  #undef ENABLE_CAMERA
+  #undef ENABLE_DISPLAY
+  #define ENABLE_WAKE_WORD false
+  #define ENABLE_BACKEND false
+  #define ENABLE_SPEAKER false
+  #define ENABLE_CAMERA false
+  #define ENABLE_DISPLAY false
+#endif
+
+#ifdef TEST_MODE_WAKE_WORD_ONLY
+  #undef ENABLE_BACKEND
+  #undef ENABLE_SPEAKER
+  #undef ENABLE_CAMERA
+  #define ENABLE_BACKEND false
+  #define ENABLE_SPEAKER false
+  #define ENABLE_CAMERA false
+#endif
+
+#ifdef TEST_MODE_BACKEND_ONLY
+  #undef ENABLE_WAKE_WORD
+  #undef ENABLE_SPEAKER
+  #undef ENABLE_CAMERA
+  #define ENABLE_WAKE_WORD false
+  #define ENABLE_SPEAKER false
+  #define ENABLE_CAMERA false
+#endif
+
+#ifdef TEST_MODE_SPEAKER_ONLY
+  #undef ENABLE_WAKE_WORD
+  #undef ENABLE_BACKEND
+  #undef ENABLE_CAMERA
+  #define ENABLE_WAKE_WORD false
+  #define ENABLE_BACKEND false
+  #define ENABLE_CAMERA false
+#endif
+
+#ifdef TEST_MODE_CAMERA_ONLY
+  #undef ENABLE_WAKE_WORD
+  #undef ENABLE_BACKEND
+  #undef ENABLE_SPEAKER
+  #define ENABLE_WAKE_WORD false
+  #define ENABLE_BACKEND false
+  #define ENABLE_SPEAKER false
+#endif
+
+#ifdef TEST_MODE_DISPLAY_ONLY
+  #undef ENABLE_WAKE_WORD
+  #undef ENABLE_BACKEND
+  #undef ENABLE_SPEAKER
+  #undef ENABLE_CAMERA
+  #define ENABLE_WAKE_WORD false
+  #define ENABLE_BACKEND false
+  #define ENABLE_SPEAKER false
+  #define ENABLE_CAMERA false
+#endif
+
+// Manual trigger flag
+volatile bool manualTriggerRequested = false;
+
+// Verbose logging helper
+#define DEBUG_LOG(fmt, ...) if (ENABLE_VERBOSE_DEBUG) { Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); }
+
 // Wake word detection settings
 const char *WAKE_WORD = "marcus";
 const int WAKE_WORD_THRESHOLD = 1000;                                        // Energy threshold
@@ -105,6 +191,7 @@ const int SILENCE_THRESHOLD = 200;    // Energy threshold for silence
 const int SILENCE_DURATION_MS = 1500; // Stop after 1.5 seconds of silence
 const int MIN_RECORDING_MS = 1000;    // Minimum 1 second recording
 const int MAX_RECORDING_MS = 10000;   // Maximum 10 seconds
+const int NO_SPEECH_TIMEOUT_MS = 5000; // Abort if no speech detected after wake word for 5 seconds
 
 // Circular buffer for I2S audio recording
 #define CIRCULAR_BUFFER_SIZE (SAMPLE_RATE * 3 * 2) // 3 seconds of 16-bit audio (~96KB)
@@ -217,6 +304,7 @@ static const size_t RECORDING_BUFFER_SIZE = MAX_AUDIO_SIZE;
 // Forward declarations
 void startRecording();
 void stopRecording();
+void abortRecording();
 size_t getRecordedDataSize();
 void copyRecordedData(int16_t *dest, size_t maxSize);
 bool sendAudioToBackend();
@@ -548,11 +636,23 @@ void startRecording()
   writeIndex = 0;
   readIndex = 0;
   isRecording = true;
+  DEBUG_LOG("Recording started - buffers reset");
 }
 
 void stopRecording()
 {
   isRecording = false;
+  DEBUG_LOG("Recording stopped");
+}
+
+void abortRecording()
+{
+  // Reset recording state and clear buffers
+  isRecording = false;
+  writeIndex = 0;
+  readIndex = 0;
+  Serial.println("[AUDIO] Recording aborted - no speech detected");
+  DEBUG_LOG("Recording aborted - buffers cleared");
 }
 
 size_t getRecordedDataSize()
@@ -576,6 +676,14 @@ void copyRecordedData(int16_t *dest, size_t maxSize)
 
 void setupCamera()
 {
+  if (!ENABLE_CAMERA)
+  {
+    Serial.println("[TEST] Camera disabled");
+    return;
+  }
+
+  DEBUG_LOG("Initializing camera...");
+  
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -603,15 +711,19 @@ void setupCamera()
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
+  DEBUG_LOG("Camera config: QVGA, JPEG, PSRAM");
+
   // Camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK)
   {
     Serial.printf("Camera init failed with error 0x%x\n", err);
+    DEBUG_LOG("Camera initialization error: 0x%x", err);
     return;
   }
 
   Serial.println("Camera initialized");
+  DEBUG_LOG("Camera ready");
 }
 
 // Continuous I2S reading into circular buffer with wake word detection
@@ -629,6 +741,8 @@ bool detectWakeWord()
   if (bytesRead > 0)
   {
     size_t samplesRead = bytesRead / sizeof(int16_t);
+
+    DEBUG_LOG("I2S read: %d bytes, %d samples", bytesRead, samplesRead);
 
     // Write to circular buffer if recording or always buffering
     for (size_t i = 0; i < samplesRead; i++)
@@ -651,10 +765,13 @@ bool detectWakeWord()
     }
     energy /= samplesRead;
 
+    DEBUG_LOG("Audio energy: %ld (threshold: %d)", energy, WAKE_WORD_THRESHOLD);
+
     // Simple threshold-based detection with debouncing
     if (energy > WAKE_WORD_THRESHOLD)
     {
       consecutiveDetections++;
+      DEBUG_LOG("Wake word candidate %d/%d", consecutiveDetections, REQUIRED_DETECTIONS);
       if (consecutiveDetections >= REQUIRED_DETECTIONS)
       {
         Serial.printf("[WAKE] Detected! Energy: %ld\n", energy);
@@ -674,6 +791,13 @@ bool detectWakeWord()
 // FreeRTOS Task: Display/Eyes Animation (runs continuously)
 void displayTask(void *parameter)
 {
+  if (!ENABLE_DISPLAY)
+  {
+    Serial.println("[TEST] Display task disabled");
+    vTaskDelete(NULL);
+    return;
+  }
+
   while (1)
   {
     // Only take mutex when needed
@@ -714,6 +838,13 @@ void displayTask(void *parameter)
 // FreeRTOS Task: Camera Face Detection
 void cameraTask(void *parameter)
 {
+  if (!ENABLE_CAMERA)
+  {
+    Serial.println("[TEST] Camera task disabled");
+    vTaskDelete(NULL);
+    return;
+  }
+
   while (1)
   {
     if (cameraEnabled)
@@ -721,6 +852,8 @@ void cameraTask(void *parameter)
       camera_fb_t *fb = esp_camera_fb_get();
       if (fb)
       {
+        DEBUG_LOG("Camera frame: %d bytes, %dx%d", fb->len, fb->width, fb->height);
+        
         // Basic face detection based on JPEG analysis
         // For production: integrate ESP-WHO face detection library
         // This is a placeholder - check if image data suggests faces
@@ -732,21 +865,28 @@ void cameraTask(void *parameter)
           {
             faceDetected = true;
             Serial.println("Face detected in frame!");
+            DEBUG_LOG("Face detected: frame size %d bytes", fb->len);
           }
           faceCount++;
         }
         else
         {
           faceDetected = false;
+          DEBUG_LOG("No face: frame too small (%d bytes)", fb->len);
         }
 
         esp_camera_fb_return(fb);
+      }
+      else
+      {
+        DEBUG_LOG("Failed to capture frame");
       }
       vTaskDelay(pdMS_TO_TICKS(500)); // Check every 500ms
     }
     else
     {
       // Camera paused - longer delay to save power
+      DEBUG_LOG("Camera paused");
       vTaskDelay(pdMS_TO_TICKS(2000));
     }
   }
@@ -757,9 +897,29 @@ void audioTask(void *parameter)
 {
   unsigned long recordingStartTime = 0;
   unsigned long lastSpeechTime = 0;
+  bool speechDetectedAfterWakeWord = false;
 
   while (1)
   {
+    // Check for manual trigger via serial
+    if (ENABLE_MANUAL_TRIGGER && manualTriggerRequested)
+    {
+      manualTriggerRequested = false;
+      Serial.println("[MANUAL] Manual trigger activated!");
+      if (currentState == STATE_LISTENING_FOR_WAKE_WORD || currentState == STATE_IDLE)
+      {
+        transitionToState(STATE_RECORDING);
+        recordingStartTime = millis();
+        lastSpeechTime = millis();
+        speechDetectedAfterWakeWord = false; // Reset flag for manual trigger too
+        DEBUG_LOG("Manual trigger - started recording");
+      }
+      else
+      {
+        Serial.printf("[MANUAL] Cannot trigger in state: %s\n", getStateName(currentState));
+      }
+    }
+
     // Check for state timeout (watchdog)
     unsigned long stateElapsed = millis() - stateStartTime;
     bool timeout = false;
@@ -813,12 +973,22 @@ void audioTask(void *parameter)
       break;
 
     case STATE_LISTENING_FOR_WAKE_WORD:
-      if (detectWakeWord())
+      if (ENABLE_WAKE_WORD)
       {
-        Serial.println("[WAKE] Wake word confirmed!");
-        transitionToState(STATE_RECORDING);
-        recordingStartTime = millis();
-        lastSpeechTime = millis();
+        if (detectWakeWord())
+        {
+          Serial.println("[WAKE] Wake word confirmed!");
+          transitionToState(STATE_RECORDING);
+          recordingStartTime = millis();
+          lastSpeechTime = millis();
+          speechDetectedAfterWakeWord = false; // Reset flag for new recording
+          DEBUG_LOG("Started recording - waiting for speech...");
+        }
+      }
+      else
+      {
+        // Wake word disabled - wait for manual trigger
+        DEBUG_LOG("Wake word disabled, waiting for manual trigger...");
       }
       vTaskDelay(pdMS_TO_TICKS(10));
       break;
@@ -833,6 +1003,8 @@ void audioTask(void *parameter)
       {
         size_t samplesRead = bytesRead / sizeof(int16_t);
 
+        DEBUG_LOG("Recording: %d samples, buffer pos: %d", samplesRead, writeIndex);
+
         // Write to circular buffer
         for (size_t i = 0; i < samplesRead; i++)
         {
@@ -841,26 +1013,44 @@ void audioTask(void *parameter)
         }
 
         // Check for silence (end of speech detection)
-        if (!detectSilence(buffer, samplesRead))
+        bool isSilent = detectSilence(buffer, samplesRead);
+        if (!isSilent)
         {
           lastSpeechTime = millis();
+          speechDetectedAfterWakeWord = true; // Mark that we detected actual speech
+          DEBUG_LOG("Speech detected - flag set");
         }
 
         unsigned long elapsed = millis() - recordingStartTime;
         unsigned long silenceDuration = millis() - lastSpeechTime;
 
-        // Check stop conditions
-        if (elapsed >= MIN_RECORDING_MS && silenceDuration > SILENCE_DURATION_MS)
+        DEBUG_LOG("Recording: %.1fs elapsed, %.1fs silence, isSilent: %d, speechDetected: %d", 
+                  elapsed / 1000.0, silenceDuration / 1000.0, isSilent, speechDetectedAfterWakeWord);
+
+        // Check for no-speech timeout (wake word but no actual speech)
+        if (!speechDetectedAfterWakeWord && elapsed > NO_SPEECH_TIMEOUT_MS)
         {
-          Serial.printf("[AUDIO] Silence detected (%.1fs recorded)\n", elapsed / 1000.0);
-          stopRecording();
-          transitionToState(STATE_PROCESSING);
+          Serial.printf("[AUDIO] No speech detected after wake word (%.1fs timeout)\n", elapsed / 1000.0);
+          abortRecording();
+          transitionToState(STATE_LISTENING_FOR_WAKE_WORD);
+          break;
         }
-        else if (elapsed > MAX_RECORDING_MS)
+
+        // Check stop conditions (only if we detected speech)
+        if (speechDetectedAfterWakeWord)
         {
-          Serial.printf("[AUDIO] Max time reached (%.1fs)\n", elapsed / 1000.0);
-          stopRecording();
-          transitionToState(STATE_PROCESSING);
+          if (elapsed >= MIN_RECORDING_MS && silenceDuration > SILENCE_DURATION_MS)
+          {
+            Serial.printf("[AUDIO] Silence detected (%.1fs recorded)\n", elapsed / 1000.0);
+            stopRecording();
+            transitionToState(STATE_PROCESSING);
+          }
+          else if (elapsed > MAX_RECORDING_MS)
+          {
+            Serial.printf("[AUDIO] Max time reached (%.1fs)\n", elapsed / 1000.0);
+            stopRecording();
+            transitionToState(STATE_PROCESSING);
+          }
         }
       }
 
@@ -871,30 +1061,44 @@ void audioTask(void *parameter)
 
     case STATE_PROCESSING:
     {
-      // Ensure WiFi is connected
-      if (!ensureWiFiConnected())
-      {
-        errorMessage = "WiFi connection lost";
-        transitionToState(STATE_ERROR);
-        break;
-      }
-
       size_t audioSize = getRecordedDataSize();
       Serial.printf("[PROCESS] Audio: %d bytes (%.1fs)\n",
                     audioSize,
                     (audioSize / 2.0) / SAMPLE_RATE);
+      DEBUG_LOG("Recorded audio size: %d bytes", audioSize);
 
-      bool success = sendAudioToBackend();
-
-      if (success)
+      if (ENABLE_BACKEND)
       {
-        Serial.println("[PROCESS] Success!");
-        transitionToState(STATE_PLAYING_RESPONSE);
+        // Ensure WiFi is connected
+        if (!ensureWiFiConnected())
+        {
+          errorMessage = "WiFi connection lost";
+          transitionToState(STATE_ERROR);
+          break;
+        }
+
+        bool success = sendAudioToBackend();
+
+        if (success)
+        {
+          Serial.println("[PROCESS] Success!");
+          transitionToState(STATE_PLAYING_RESPONSE);
+        }
+        else
+        {
+          errorMessage = "Backend communication failed";
+          transitionToState(STATE_ERROR);
+        }
       }
       else
       {
-        errorMessage = "Backend communication failed";
-        transitionToState(STATE_ERROR);
+        // Backend disabled - simulate response for testing
+        Serial.println("[TEST] Backend disabled - skipping processing");
+        DEBUG_LOG("Would have sent %d bytes to backend", audioSize);
+        
+        // Skip to next state or return to listening
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        transitionToState(STATE_LISTENING_FOR_WAKE_WORD);
       }
     }
     break;
@@ -939,9 +1143,12 @@ void audioTask(void *parameter)
 bool sendAudioToBackend()
 {
   size_t audioDataSize = getRecordedDataSize();
+  DEBUG_LOG("sendAudioToBackend: audioDataSize=%d", audioDataSize);
+  
   if (WiFi.status() != WL_CONNECTED || audioDataSize == 0)
   {
     Serial.println("[ERROR] WiFi not connected or no audio data");
+    DEBUG_LOG("WiFi status: %d, audioDataSize: %d", WiFi.status(), audioDataSize);
     return false;
   }
 
@@ -956,6 +1163,7 @@ bool sendAudioToBackend()
   size_t recordedAudioBufferSize = audioDataSize;
 
   Serial.println("[HTTP] Sending audio to backend...");
+  DEBUG_LOG("Connecting to: %s", serverUrl);
 
   HTTPClient http;
   http.begin(serverUrl);
@@ -1025,11 +1233,13 @@ bool sendAudioToBackend()
   free(fullAudio);
 
   Serial.printf("[HTTP] Response code: %d\n", httpResponseCode);
+  DEBUG_LOG("HTTP response: %d", httpResponseCode);
 
   if (httpResponseCode == 200)
   {
     // Extract emotion timeline from response header
     String segmentsJson = http.header("X-LLM-Segments");
+    DEBUG_LOG("Emotion segments JSON: %s", segmentsJson.c_str());
 
     if (segmentsJson.length() > 0)
     {
@@ -1074,6 +1284,7 @@ bool sendAudioToBackend()
     // Get raw MP3 audio data
     int contentLength = http.getSize();
     Serial.printf("[AUDIO] Response size: %d bytes\n", contentLength);
+    DEBUG_LOG("MP3 content length: %d bytes", contentLength);
 
     if (contentLength > 0)
     {
@@ -1084,11 +1295,13 @@ bool sendAudioToBackend()
           free(mp3DataBuffer);
         mp3DataBuffer = (uint8_t *)malloc(contentLength);
         mp3BufferCapacity = contentLength;
+        DEBUG_LOG("Allocated MP3 buffer: %d bytes", contentLength);
       }
 
       if (!mp3DataBuffer)
       {
         Serial.println("[ERROR] Failed to allocate MP3 buffer!");
+        DEBUG_LOG("malloc failed for %d bytes", contentLength);
         http.end();
         return false;
       }
@@ -1113,40 +1326,54 @@ bool sendAudioToBackend()
       // Play audio with emotion timeline
       if (bytesRead > 0)
       {
-        Serial.println("[AUDIO] Playing with emotion timeline...");
-
-        // Clean up previous playback resources
-        cleanupAudioPlayback();
-
-        // Stream MP3 directly from memory
-        audioMemorySource = new AudioFileSourceMemory(mp3DataBuffer, bytesRead);
-        mp3PlaybackBuffer = new AudioFileSourceBuffer(audioMemorySource, 2048);
-
-        if (mp3->begin(mp3PlaybackBuffer, audioOutput))
+        if (ENABLE_SPEAKER)
         {
-          isPlayingAudio = true;
-          audioPlaybackStartTime = millis();
-          currentSegmentIndex = 0;
+          Serial.println("[AUDIO] Playing with emotion timeline...");
+          DEBUG_LOG("Starting MP3 playback: %d bytes", bytesRead);
 
-          // Play audio loop - emotion changes handled in displayTask
-          while (mp3->isRunning())
+          // Clean up previous playback resources
+          cleanupAudioPlayback();
+
+          // Stream MP3 directly from memory
+          audioMemorySource = new AudioFileSourceMemory(mp3DataBuffer, bytesRead);
+          mp3PlaybackBuffer = new AudioFileSourceBuffer(audioMemorySource, 2048);
+
+          if (mp3->begin(mp3PlaybackBuffer, audioOutput))
           {
-            if (!mp3->loop())
-            {
-              mp3->stop();
-              break;
-            }
-            yield();
-          }
+            isPlayingAudio = true;
+            audioPlaybackStartTime = millis();
+            currentSegmentIndex = 0;
+            DEBUG_LOG("MP3 playback started");
 
-          isPlayingAudio = false;
-          Serial.println("[AUDIO] Playback complete!");
+            // Play audio loop - emotion changes handled in displayTask
+            while (mp3->isRunning())
+            {
+              if (!mp3->loop())
+              {
+                mp3->stop();
+                break;
+              }
+              yield();
+            }
+
+            isPlayingAudio = false;
+            Serial.println("[AUDIO] Playback complete!");
+            DEBUG_LOG("MP3 playback finished");
+          }
+          else
+          {
+            Serial.println("[ERROR] Failed to start MP3 playback!");
+            DEBUG_LOG("mp3->begin() failed");
+            http.end();
+            return false;
+          }
         }
         else
         {
-          Serial.println("[ERROR] Failed to start MP3 playback!");
-          http.end();
-          return false;
+          Serial.println("[TEST] Speaker disabled - skipping playback");
+          DEBUG_LOG("Would have played %d bytes of MP3 data", bytesRead);
+          // Simulate playback time
+          vTaskDelay(pdMS_TO_TICKS(2000));
         }
 
         http.end();
@@ -1159,10 +1386,12 @@ bool sendAudioToBackend()
     Serial.printf("[ERROR] Backend error: %d\n", httpResponseCode);
     String errorPayload = http.getString();
     Serial.println(errorPayload);
+    DEBUG_LOG("HTTP error payload: %s", errorPayload.c_str());
   }
   else
   {
     Serial.printf("[ERROR] Connection failed: %s\n", http.errorToString(httpResponseCode).c_str());
+    DEBUG_LOG("HTTP connection error code: %d", httpResponseCode);
   }
 
   http.end();
@@ -1234,34 +1463,46 @@ void setup()
   setupCamera();
 
   // Initialize OLED display
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
+  if (ENABLE_DISPLAY)
   {
-    Serial.println("OLED initialization failed!");
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
+    {
+      Serial.println("OLED initialization failed!");
+    }
+    else
+    {
+      Serial.println("OLED initialized");
+      DEBUG_LOG("Display: %dx%d, address 0x%X", SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_ADDRESS);
+      display.clearDisplay();
+      eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 60);
+      eyes.setAutoblinker(true, 3, 2);
+      eyes.setIdleMode(true, 2, 2);
+      eyes.setMood(HAPPY);
+      display.display();
+    }
   }
   else
   {
-    Serial.println("OLED initialized");
-    display.clearDisplay();
-    eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 60);
-    eyes.setAutoblinker(true, 3, 2);
-    eyes.setIdleMode(true, 2, 2);
-    eyes.setMood(HAPPY);
-    display.display();
+    Serial.println("[TEST] Display disabled");
   }
 
   // Create FreeRTOS mutex for display access
   displayMutex = xSemaphoreCreateMutex();
 
   // Create FreeRTOS tasks
-  xTaskCreatePinnedToCore(
-      displayTask,
-      "DisplayTask",
-      4096,
-      NULL,
-      1,
-      &displayTaskHandle,
-      0 // Core 0
-  );
+  if (ENABLE_DISPLAY)
+  {
+    xTaskCreatePinnedToCore(
+        displayTask,
+        "DisplayTask",
+        4096,
+        NULL,
+        1,
+        &displayTaskHandle,
+        0 // Core 0
+    );
+    DEBUG_LOG("Display task created on Core 0");
+  }
 
   xTaskCreatePinnedToCore(
       audioTask,
@@ -1272,19 +1513,36 @@ void setup()
       &audioTaskHandle,
       1 // Core 1
   );
+  DEBUG_LOG("Audio task created on Core 1");
 
-  xTaskCreatePinnedToCore(
-      cameraTask,
-      "CameraTask",
-      4096,
-      NULL,
-      1,
-      &cameraTaskHandle,
-      1 // Core 1
-  );
+  if (ENABLE_CAMERA)
+  {
+    xTaskCreatePinnedToCore(
+        cameraTask,
+        "CameraTask",
+        4096,
+        NULL,
+        1,
+        &cameraTaskHandle,
+        1 // Core 1
+    );
+    DEBUG_LOG("Camera task created on Core 1");
+  }
+
+  // Print test configuration
+  Serial.println("\n=== MarcusBot Test Configuration ===");
+  Serial.printf("Wake Word:   %s\n", ENABLE_WAKE_WORD ? "ENABLED" : "DISABLED");
+  Serial.printf("Backend:     %s\n", ENABLE_BACKEND ? "ENABLED" : "DISABLED");
+  Serial.printf("Speaker:     %s\n", ENABLE_SPEAKER ? "ENABLED" : "DISABLED");
+  Serial.printf("Camera:      %s\n", ENABLE_CAMERA ? "ENABLED" : "DISABLED");
+  Serial.printf("Display:     %s\n", ENABLE_DISPLAY ? "ENABLED" : "DISABLED");
+  Serial.printf("Verbose Log: %s\n", ENABLE_VERBOSE_DEBUG ? "ENABLED" : "DISABLED");
+  Serial.printf("Manual Trig: %s\n", ENABLE_MANUAL_TRIGGER ? "ENABLED" : "DISABLED");
+  Serial.println("======================================\n");
 
   Serial.println("\n=== Ready! Say 'Marcus' to start ===");
-  Serial.println("Face detection: Active");
+  if (ENABLE_CAMERA)
+    Serial.println("Face detection: Active");
   Serial.println("Tasks running on both cores");
   Serial.printf("Initial state: %s\n", getStateName(currentState));
   Serial.printf("[MEM] Free heap after init: %d bytes\n", ESP.getFreeHeap());
@@ -1292,30 +1550,88 @@ void setup()
   // Self-test confirmation
   Serial.println("\n[SELF-TEST] System Check:");
   Serial.printf("  [%s] WiFi\n", WiFi.status() == WL_CONNECTED ? "OK" : "FAIL");
-  Serial.printf("  [%s] Display\n", display.getPixel(0, 0) >= 0 ? "OK" : "FAIL");
+  if (ENABLE_DISPLAY)
+    Serial.printf("  [%s] Display\n", display.getPixel(0, 0) >= 0 ? "OK" : "FAIL");
   Serial.printf("  [%s] Microphone\n", "OK"); // Assume OK if I2S initialized
   Serial.printf("  [%s] Speaker\n", audioOutput ? "OK" : "FAIL");
-  Serial.printf("  [%s] Camera\n", "OK"); // Assume OK if camera initialized
+  if (ENABLE_CAMERA)
+    Serial.printf("  [%s] Camera\n", "OK"); // Assume OK if camera initialized
   Serial.printf("  [%s] Recording Buffer\n", preAllocatedRecordBuffer ? "OK" : "FAIL");
-  Serial.println("\nListening for wake word...\n");
+  
+  if (ENABLE_MANUAL_TRIGGER)
+  {
+    Serial.println("\n[MANUAL] Send 't' via Serial to manually trigger recording");
+  }
+  
+  if (ENABLE_WAKE_WORD)
+  {
+    Serial.println("\nListening for wake word...\n");
+  }
+  else
+  {
+    Serial.println("\nWake word disabled - use manual trigger\n");
+  }
 
   digitalWrite(LED_PIN, LOW);
 }
 
 void loop()
 {
+  // Check for serial commands (manual trigger)
+  if (ENABLE_MANUAL_TRIGGER && Serial.available() > 0)
+  {
+    char cmd = Serial.read();
+    if (cmd == 't' || cmd == 'T')
+    {
+      Serial.println("\n[MANUAL] Trigger command received!");
+      manualTriggerRequested = true;
+    }
+    else if (cmd == 's' || cmd == 'S')
+    {
+      // Status command
+      Serial.println("\n=== System Status ===");
+      Serial.printf("State:       %s\n", getStateName(currentState));
+      Serial.printf("Free Heap:   %d bytes\n", ESP.getFreeHeap());
+      Serial.printf("WiFi:        %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+      if (ENABLE_CAMERA)
+        Serial.printf("Face:        %s (count: %d)\n", faceDetected ? "Detected" : "None", faceCount);
+      Serial.printf("Audio:       %s\n", isPlayingAudio ? "Playing" : "Idle");
+      Serial.printf("Recording:   %s\n", isRecording ? "Active" : "Idle");
+      Serial.println("=====================\n");
+    }
+    else if (cmd == 'h' || cmd == 'H' || cmd == '?')
+    {
+      // Help command
+      Serial.println("\n=== Serial Commands ===");
+      Serial.println("t/T - Manually trigger recording");
+      Serial.println("s/S - Show system status");
+      Serial.println("h/H/? - Show this help");
+      Serial.println("========================\n");
+    }
+  }
+
   // All work is done in FreeRTOS tasks
   // Main loop just monitors and logs status
   static unsigned long lastStatusPrint = 0;
 
   if (millis() - lastStatusPrint > 10000) // Every 10 seconds
   {
-    Serial.printf("[STATUS] State: %s | Face: %s (n=%d) | Heap: %d bytes | WiFi: %s\n",
-                  getStateName(currentState),
-                  faceDetected ? "YES" : "NO",
-                  faceCount,
-                  ESP.getFreeHeap(),
-                  WiFi.status() == WL_CONNECTED ? "OK" : "DISCONNECTED");
+    if (ENABLE_CAMERA)
+    {
+      Serial.printf("[STATUS] State: %s | Face: %s (n=%d) | Heap: %d bytes | WiFi: %s\n",
+                    getStateName(currentState),
+                    faceDetected ? "YES" : "NO",
+                    faceCount,
+                    ESP.getFreeHeap(),
+                    WiFi.status() == WL_CONNECTED ? "OK" : "DISCONNECTED");
+    }
+    else
+    {
+      Serial.printf("[STATUS] State: %s | Heap: %d bytes | WiFi: %s\n",
+                    getStateName(currentState),
+                    ESP.getFreeHeap(),
+                    WiFi.status() == WL_CONNECTED ? "OK" : "DISCONNECTED");
+    }
     lastStatusPrint = millis();
   }
 
