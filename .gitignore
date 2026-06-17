@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Generated Edge Impulse inferencing SDK (regenerable, ~28M) — not tracked
+lib/oasker-project-1_inferencing/

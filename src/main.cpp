@@ -34,11 +34,15 @@
 //      GND  → GND
 //
 //   2. I2S Speaker/Amplifier (e.g., MAX98357A):
-//      BCK  → GPIO 4 (Bit Clock)
-//      WS   → GPIO 8 (Word Select/LRCK)
-//      DOUT → GPIO 9 (Data Out)
-//      VIN  → 3.3V or 5V (check your amp)
-//      GND  → GND
+//      Your Amp Pin  →  ESP32 Pin
+//      ───────────────────────────
+//      LRC           →  GPIO 8 (Word Select)
+//      BCLK          →  GPIO 4 (Bit Clock)
+//      DIN           →  GPIO 9 (Data Out from ESP32)
+//      GAin          →  GND (low gain) or 3.3V (high gain)
+//      SD            →  3.3V (shutdown control - tie high to enable)
+//      VIN           →  3.3V or 5V (power - check your amp datasheet)
+//      GND           →  GND
 //
 //   3. Power:
 //      - Connect USB-C cable for power and programming
@@ -60,9 +64,9 @@ RoboEyes<Adafruit_SSD1306> eyes(display);
 String currentEmotion = "happy";
 
 // WiFi Configuration
-const char *ssid = "Verizon_WNLM7H";
-const char *password = "joy-sierra6-icy";
-const char *serverUrl = "http://192.168.1.188:3000/api/process";
+const char *ssid = "Verizon_WNLM7H-IoT";
+const char *password = "YOUR_WIFI_PASSWORD";
+const char *serverUrl = "http://192.168.1.191:3000/api/process";
 
 // WiFi recovery helper
 bool ensureWiFiConnected()
@@ -222,7 +226,7 @@ const int RECORDING_DURATION_MS = 5000;                                      // 
 const int MAX_AUDIO_SIZE = SAMPLE_RATE * (RECORDING_DURATION_MS / 1000) * 2; // 16-bit samples
 
 // Silence detection settings for end-of-speech detection
-const int SILENCE_THRESHOLD = 200;     // Energy threshold for silence
+const int SILENCE_THRESHOLD = 800;     // Energy threshold for silence (increased for PDM mic)
 const int SILENCE_DURATION_MS = 1500;  // Stop after 1.5 seconds of silence
 const int MIN_RECORDING_MS = 1000;     // Minimum 1 second recording
 const int MAX_RECORDING_MS = 10000;    // Maximum 10 seconds
@@ -441,16 +445,26 @@ void transitionToState(SystemState newState)
   }
 }
 
-// Silence Detection for End-of-Speech
+// Silence Detection for End-of-Speech with DC bias removal
 bool detectSilence(int16_t *buffer, size_t samples)
 {
   if (samples == 0)
     return true;
 
+  // Calculate DC offset (average value)
+  long dcOffset = 0;
+  for (size_t i = 0; i < samples; i++)
+  {
+    dcOffset += buffer[i];
+  }
+  dcOffset /= samples;
+
+  // Calculate energy with DC offset removed
   long energy = 0;
   for (size_t i = 0; i < samples; i++)
   {
-    energy += abs(buffer[i]);
+    int16_t sample = buffer[i] - dcOffset;
+    energy += abs(sample);
   }
   energy /= samples;
 
@@ -532,7 +546,7 @@ void displayText(const char *text)
 void setupI2S()
 {
   i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
       .sample_rate = SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
       .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
@@ -545,14 +559,15 @@ void setupI2S()
       .fixed_mclk = 0};
 
   i2s_pin_config_t pin_config = {
-      .bck_io_num = I2S_SCK,
-      .ws_io_num = I2S_WS,
+      .bck_io_num = I2S_PIN_NO_CHANGE,
+      .ws_io_num = I2S_SCK, // PDM CLK
       .data_out_num = I2S_PIN_NO_CHANGE,
-      .data_in_num = I2S_SD};
+      .data_in_num = I2S_SD}; // PDM DATA
 
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
   i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  i2s_zero_dma_buffer(I2S_PORT);
 
   Serial.println("I2S microphone initialized");
 }
@@ -779,6 +794,13 @@ bool detectWakeWord()
 
     DEBUG_LOG("I2S read: %d bytes, %d samples", bytesRead, samplesRead);
 
+    // Debug: Show raw sample values
+    if (samplesRead >= 5)
+    {
+      Serial.printf("[RAW] First 5 samples: %d, %d, %d, %d, %d\n",
+                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]);
+    }
+
     // Write to circular buffer if recording or always buffering
     for (size_t i = 0; i < samplesRead; i++)
     {
@@ -792,15 +814,24 @@ bool detectWakeWord()
       }
     }
 
-    // Calculate energy for wake word detection
+    // Calculate DC offset
+    long dcOffset = 0;
+    for (size_t i = 0; i < samplesRead; i++)
+    {
+      dcOffset += buffer[i];
+    }
+    dcOffset /= samplesRead;
+
+    // Calculate energy with DC offset removed for wake word detection
     long energy = 0;
     for (size_t i = 0; i < samplesRead; i++)
     {
-      energy += abs(buffer[i]);
+      int16_t sample = buffer[i] - dcOffset;
+      energy += abs(sample);
     }
     energy /= samplesRead;
 
-    DEBUG_LOG("Audio energy: %ld (threshold: %d)", energy, WAKE_WORD_THRESHOLD);
+    DEBUG_LOG("Audio energy: %ld (DC: %ld, threshold: %d)", energy, dcOffset, WAKE_WORD_THRESHOLD);
 
     // Simple threshold-based detection with debouncing
     if (energy > WAKE_WORD_THRESHOLD)
@@ -1047,8 +1078,26 @@ void audioTask(void *parameter)
           writeIndex = (writeIndex + 1) % CIRCULAR_BUFFER_SIZE;
         }
 
+        // Calculate DC offset and energy with bias removal for accurate detection
+        long dcOffset = 0;
+        for (size_t i = 0; i < samplesRead; i++)
+        {
+          dcOffset += buffer[i];
+        }
+        dcOffset /= samplesRead;
+
+        // Calculate energy with DC offset removed
+        long energy = 0;
+        for (size_t i = 0; i < samplesRead; i++)
+        {
+          int16_t sample = buffer[i] - dcOffset;
+          energy += abs(sample);
+        }
+        energy /= samplesRead;
+
         // Check for silence (end of speech detection)
         bool isSilent = detectSilence(buffer, samplesRead);
+
         if (!isSilent)
         {
           lastSpeechTime = millis();
@@ -1059,8 +1108,8 @@ void audioTask(void *parameter)
         unsigned long elapsed = millis() - recordingStartTime;
         unsigned long silenceDuration = millis() - lastSpeechTime;
 
-        DEBUG_LOG("Recording: %.1fs elapsed, %.1fs silence, isSilent: %d, speechDetected: %d",
-                  elapsed / 1000.0, silenceDuration / 1000.0, isSilent, speechDetectedAfterWakeWord);
+        DEBUG_LOG("Recording: %.1fs elapsed, %.1fs silence, energy: %ld, isSilent: %d, speechDetected: %d",
+                  elapsed / 1000.0, silenceDuration / 1000.0, energy, isSilent, speechDetectedAfterWakeWord);
 
         // Check for no-speech timeout (wake word but no actual speech)
         if (!speechDetectedAfterWakeWord && elapsed > NO_SPEECH_TIMEOUT_MS)
@@ -1461,26 +1510,38 @@ void setup()
 
   // Connect to WiFi
   Serial.println("Connecting to WiFi...");
+  WiFi.mode(WIFI_STA); // Set to Station mode
+  WiFi.disconnect();   // Disconnect from any previous connection
+  delay(100);
   WiFi.begin(ssid, password);
 
+  Serial.printf("SSID: %s\n", ssid);
+
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) // Increased timeout
   {
     delay(500);
     Serial.print(".");
+    Serial.print(WiFi.status()); // Print status code for debugging
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("\nWiFi connected");
+    Serial.println("\n[WIFI] Connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
     blinkGreen(3);
   }
   else
   {
-    Serial.println("\nWiFi connection failed");
+    Serial.println("\n[WIFI] Connection FAILED!");
+    Serial.print("Status code: ");
+    Serial.println(WiFi.status());
+    Serial.println("Codes: 0=IDLE, 1=NO_SSID, 3=CONNECTED, 4=FAILED, 6=DISCONNECTED");
+    Serial.println("Check: 1) Is network 2.4GHz? 2) Correct password? 3) In range?");
     blinkRed(3);
     return;
   }
